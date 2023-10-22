@@ -54,6 +54,50 @@ class SyncException: Exception {
     }
 }
 
+struct RawJsonItemsNode {
+	JSONValue payload;
+	RawJsonItemsNode * next;
+}
+
+class RawJsonItemsList {
+	RawJsonItemsNode * head;
+	RawJsonItemsNode * tail;
+
+	this() {
+		head = new RawJsonItemsNode();
+		tail = head;
+	}
+
+	void insert(JSONValue payload) {
+		RawJsonItemsNode* newNode = new RawJsonItemsNode(payload, null);
+		tail.next = newNode;
+		tail = newNode;
+	}
+
+	void clear() {
+		head.next = null;
+		tail = head;
+	}
+
+	JSONValue popFront()
+    {
+		scope (exit) { 
+			head = head.next; 
+			object.destroy(head.payload);
+		}
+		return head.next.payload;
+    }
+
+	@property bool empty() const
+    {
+        return head.next == null;
+    }
+}
+
+void startBackgroundFetchJob(SyncEngine syncEngine, string driveIdToQuery = null, string itemIdToQuery = null, string sharedFolderName = null) {
+	syncEngine.fetchOneDriveDeltaAPIResponseTask(driveIdToQuery, itemIdToQuery, sharedFolderName);
+}
+
 class SyncEngine {
 	// Class Variables
 	ApplicationConfig appConfig;
@@ -66,6 +110,8 @@ class SyncEngine {
 	RedBlackTree!string skippedItems = redBlackTree!string();
 	// Array of databaseItem.id to delete after the changes have been downloaded
 	string[2][] idsToDelete;
+	// Raw json data downloaded
+	RawJsonItemsList rawJsonItems = new RawJsonItemsList;
 	// Array of JSON items which are files or directories that are not 'root', skipped or to be deleted, that need to be processed
 	JSONValue[] jsonItemsToProcess;
 	// Array of JSON items which are files that are not 'root', skipped or to be deleted, that need to be downloaded
@@ -147,8 +193,6 @@ class SyncEngine {
 	ulong processedCount;
 	// Are we creating a simulated /delta response? This is critically important in terms of how we 'update' the database
 	bool generateSimulatedDeltaResponse = false;
-	// Store the latest DeltaLink
-	string latestDeltaLink;
 	
 	// Configure this class instance
 	this(ApplicationConfig appConfig, ItemDatabase itemDB, ClientSideFiltering selectiveSync) {
@@ -510,8 +554,6 @@ class SyncEngine {
 		log.vdebug("Perform a Full Scan True-Up: ", appConfig.fullScanTrueUpRequired);
 		// Fetch the API response of /delta to track changes on OneDrive
 		fetchOneDriveDeltaAPIResponse(null, null, null);
-		// Process any download activities or cleanup actions
-		processDownloadActivities();
 		
 		// If singleDirectoryScope is false, we are not targeting a single directory
 		// but if true, the target 'could' be a shared folder - so dont try and scan it again
@@ -541,8 +583,6 @@ class SyncEngine {
 					}
 					// Check this OneDrive Personal Shared Folder for changes
 					fetchOneDriveDeltaAPIResponse(remoteItem.remoteDriveId, remoteItem.remoteId, remoteItem.name);
-					// Process any download activities or cleanup actions for this OneDrive Personal Shared Folder
-					processDownloadActivities();
 				}
 			} else {
 				// Is this a Business Account with Sync Business Shared Items enabled?
@@ -579,9 +619,6 @@ class SyncEngine {
 						
 						// Check this OneDrive Personal Shared Folder for changes
 						fetchOneDriveDeltaAPIResponse(remoteItem.remoteDriveId, remoteItem.remoteId, remoteItem.name);
-						
-						// Process any download activities or cleanup actions for this OneDrive Personal Shared Folder
-						processDownloadActivities();
 					}
 				}
 			}
@@ -638,39 +675,14 @@ class SyncEngine {
 			exit(EXIT_FAILURE);
 		}
 	}
-	
-	// Query OneDrive API for /delta changes and iterate through items online
-	void fetchOneDriveDeltaAPIResponse(string driveIdToQuery = null, string itemIdToQuery = null, string sharedFolderName = null) {
-				
-		string deltaLink = null;
+
+	// // Query OneDrive API for /delta changes and iterate through items online in background
+	void fetchOneDriveDeltaAPIResponseTask(string driveIdToQuery = null, string itemIdToQuery = null, string sharedFolderName = null) {
 		string currentDeltaLink = null;
 		string deltaLinkAvailable;
 		JSONValue deltaChanges;
-		ulong responseBundleCount;
 		ulong jsonItemsReceived = 0;
-		
-		// Reset jsonItemsToProcess & processedCount
-		jsonItemsToProcess = [];
-		processedCount = 0;
-		
-		// Was a driveId provided as an input
-		//if (driveIdToQuery == "") {
-		if (strip(driveIdToQuery).empty) {
-			// No provided driveId to query, use the account default
-			log.vdebug("driveIdToQuery was empty, setting to appConfig.defaultDriveId");
-			driveIdToQuery = appConfig.defaultDriveId;
-			log.vdebug("driveIdToQuery: ", driveIdToQuery);
-		}
-		
-		// Was an itemId provided as an input
-		//if (itemIdToQuery == "") {
-		if (strip(itemIdToQuery).empty) {
-			// No provided itemId to query, use the account default
-			log.vdebug("itemIdToQuery was empty, setting to appConfig.defaultRootId");
-			itemIdToQuery = appConfig.defaultRootId;
-			log.vdebug("itemIdToQuery: ", itemIdToQuery);
-		}
-		
+
 		// What OneDrive API query do we use?
 		// - Are we running against a National Cloud Deployments that does not support /delta ?
 		//   National Cloud Deployments do not support /delta as a query
@@ -703,17 +715,6 @@ class SyncEngine {
 				log.vdebug("Setting currentDeltaLink = null");
 				currentDeltaLink = null;
 			}
-			
-			// Dynamic output for non-verbose and verbose run so that the user knows something is being retreived from the OneDrive API
-			if (log.verbose <= 1) {
-				if (!appConfig.surpressLoggingOutput) {
-					log.fileOnly("Fetching items from the OneDrive API for Drive ID: ", driveIdToQuery);
-					// Use the dots to show the application is 'doing something'
-					write("Fetching items from the OneDrive API for Drive ID: ", driveIdToQuery, " .");
-				}
-			} else {
-				log.vdebug("Fetching /delta response from the OneDrive API for Drive ID: ", driveIdToQuery);
-			}
 							
 			// Create a new API Instance for querying /delta and initialise it
 			OneDriveApi getDeltaQueryOneDriveApiInstance;
@@ -721,11 +722,10 @@ class SyncEngine {
 			getDeltaQueryOneDriveApiInstance.initialise();
 			
 			for (;;) {
-				responseBundleCount++;
 				// Get the /delta changes via the OneDrive API
 				// getDeltaChangesByItemId has the re-try logic for transient errors
 				deltaChanges = getDeltaChangesByItemId(driveIdToQuery, itemIdToQuery, currentDeltaLink, getDeltaQueryOneDriveApiInstance);
-				
+
 				// If the initial deltaChanges response is an invalid JSON object, keep trying ..
 				if (deltaChanges.type() != JSONType.object) {
 					while (deltaChanges.type() != JSONType.object) {
@@ -736,68 +736,25 @@ class SyncEngine {
 				}
 				
 				ulong nrChanges = count(deltaChanges["value"].array);
-				int changeCount = 0;
-				
-				if (log.verbose <= 1) {
-					// Dynamic output for a non-verbose run so that the user knows something is happening
-					if (!appConfig.surpressLoggingOutput) {
-						write(".");
-					}
-				} else {
-					log.vdebug("API Response Bundle: ", responseBundleCount, " - Quantity of 'changes|items' in this bundle to process: ", nrChanges);
-				}
-				
 				jsonItemsReceived = jsonItemsReceived + nrChanges;
-				
-				// We have a valid deltaChanges JSON array. This means we have at least 200+ JSON items to process.
-				// The API response however cannot be run in parallel as the OneDrive API sends the JSON items in the order in which they must be processed
-				foreach (onedriveJSONItem; deltaChanges["value"].array) {
-					// increment change count for this item
-					changeCount++;
-					// Process the OneDrive object item JSON
-					processDeltaJSONItem(onedriveJSONItem, nrChanges, changeCount, responseBundleCount, singleDirectoryScope);
-				}
-				
-				// The response may contain either @odata.deltaLink or @odata.nextLink
-				if ("@odata.deltaLink" in deltaChanges) {
-					// Log action
-					log.vdebug("Setting next currentDeltaLink to (@odata.deltaLink): ", deltaChanges["@odata.deltaLink"].str);
-					// Update currentDeltaLink
-					currentDeltaLink = deltaChanges["@odata.deltaLink"].str;
-					// Store this for later use post processing jsonItemsToProcess items
-					latestDeltaLink = deltaChanges["@odata.deltaLink"].str;
-				}
-				
+				rawJsonItems.insert(deltaChanges);
+
 				// Update deltaLink to next changeSet bundle
 				if ("@odata.nextLink" in deltaChanges) {	
 					// Log action
-					log.vdebug("Setting next currentDeltaLink & deltaLinkAvailable to (@odata.nextLink): ", deltaChanges["@odata.nextLink"].str);
+					log.vdebug("Setting next currentDeltaLink to (@odata.nextLink): ", deltaChanges["@odata.nextLink"].str);
 					// Update currentDeltaLink
 					currentDeltaLink = deltaChanges["@odata.nextLink"].str;
-					// Update deltaLinkAvailable to next changeSet bundle to quantify how many changes we have to process
-					deltaLinkAvailable = deltaChanges["@odata.nextLink"].str;
-					// Store this for later use post processing jsonItemsToProcess items
-					latestDeltaLink = deltaChanges["@odata.nextLink"].str;
 				}
 				else break;
 			}
-			
-			// To finish off the JSON processing items, this is needed to reflect this in the log
-			log.vdebug("------------------------------------------------------------------");
 			
 			// Shutdown the API
 			getDeltaQueryOneDriveApiInstance.shutdown();
 			// Free object and memory
 			object.destroy(getDeltaQueryOneDriveApiInstance);
 			
-			// Log that we have finished querying the /delta API
-			if (log.verbose <= 1) {
-				if (!appConfig.surpressLoggingOutput) {
-					write("\n");
-				}
-			} else {
-				log.vdebug("Finished processing /delta JSON response from the OneDrive API");
-			}
+			log.vdebug("Finished processing /delta JSON response from the OneDrive API");
 			
 			// If this was set, now unset it, as this will have been completed, so that for a true up, we dont do a double full scan
 			if (appConfig.fullScanTrueUpRequired) {
@@ -837,17 +794,8 @@ class SyncEngine {
 			deltaChanges = generateDeltaResponse(pathToQuery);
 			
 			ulong nrChanges = count(deltaChanges["value"].array);
-			int changeCount = 0;
-			log.vdebug("API Response Bundle: ", responseBundleCount, " - Quantity of 'changes|items' in this bundle to process: ", nrChanges);
 			jsonItemsReceived = jsonItemsReceived + nrChanges;
-			
-			// The API response however cannot be run in parallel as the OneDrive API sends the JSON items in the order in which they must be processed
-			foreach (onedriveJSONItem; deltaChanges["value"].array) {
-				// increment change count for this item
-				changeCount++;
-				// Process the OneDrive object item JSON
-				processDeltaJSONItem(onedriveJSONItem, nrChanges, changeCount, responseBundleCount, singleDirectoryScope);	
-			}
+			rawJsonItems.insert(deltaChanges);
 			
 			// To finish off the JSON processing items, this is needed to reflect this in the log
 			log.vdebug("------------------------------------------------------------------");
@@ -860,78 +808,138 @@ class SyncEngine {
 		
 		// Cleanup deltaChanges as this is no longer needed
 		object.destroy(deltaChanges);
-		
+
 		// We have JSON items received from the OneDrive API
 		log.vdebug("Number of JSON Objects received from OneDrive API:                 ", jsonItemsReceived);
-		log.vdebug("Number of JSON Objects already processed (root and deleted items): ", (jsonItemsReceived - jsonItemsToProcess.length));
+	}
+
+	// Query OneDrive API for /delta changes and iterate through items online
+	void fetchOneDriveDeltaAPIResponse(string driveIdToQuery = null, string itemIdToQuery = null, string sharedFolderName = null) {
+
+		ulong responseBundleCount;
+		ulong jsonItemsReceived = 0;
+
+		// Was a driveId provided as an input
+		//if (driveIdToQuery == "") {
+		if (strip(driveIdToQuery).empty) {
+			// No provided driveId to query, use the account default
+			log.vdebug("driveIdToQuery was empty, setting to appConfig.defaultDriveId");
+			driveIdToQuery = appConfig.defaultDriveId;
+			log.vdebug("driveIdToQuery: ", driveIdToQuery);
+		}
 		
-		// We should have now at least processed all the JSON items as returned by the /delta call
-		// Additionally, we should have a new array, that now contains all the JSON items we need to process that are non 'root' or deleted items
-		log.vdebug("Number of JSON items to process is: ", jsonItemsToProcess.length);
-		
-		// Are there items to process?
-		if (jsonItemsToProcess.length > 0) {
-			// Lets deal with the JSON items in a batch process
-			ulong batchSize = 500;
-			ulong batchCount = (jsonItemsToProcess.length + batchSize - 1) / batchSize;
-			ulong batchesProcessed = 0;
-			
-			// Dynamic output for a non-verbose run so that the user knows something is happening
+		// Was an itemId provided as an input
+		//if (itemIdToQuery == "") {
+		if (strip(itemIdToQuery).empty) {
+			// No provided itemId to query, use the account default
+			log.vdebug("itemIdToQuery was empty, setting to appConfig.defaultRootId");
+			itemIdToQuery = appConfig.defaultRootId;
+			log.vdebug("itemIdToQuery: ", itemIdToQuery);
+		}
+
+		// start the background downloading job first
+		auto job = task!startBackgroundFetchJob(this, driveIdToQuery, itemIdToQuery, sharedFolderName);
+		job.executeInNewThread();
+							
+		// Dynamic output for non-verbose and verbose run so that the user knows something is being retreived from the OneDrive API
+		if (log.verbose <= 1) {
 			if (!appConfig.surpressLoggingOutput) {
-				write("Processing ", jsonItemsToProcess.length, " applicable changes and items received from Microsoft OneDrive ");
-				log.fileOnly("Processing ", jsonItemsToProcess.length, " applicable changes and items received from Microsoft OneDrive");
-				if (log.verbose != 0) {
-					// close out the write() processing line above
-					writeln();
-				}
+				log.fileOnly("Fetching items from the OneDrive API for Drive ID: ", driveIdToQuery);
+				// Use the dots to show the application is 'doing something'
+				write("Fetching items from the OneDrive API for Drive ID: ", driveIdToQuery, " .");
 			}
+		} else {
+			log.vdebug("Fetching /delta response from the OneDrive API for Drive ID: ", driveIdToQuery);
+		}
+
+		processedCount = 0;
+		for (;;) {
+			responseBundleCount++;
 			
-			// For each batch, process the JSON items that need to be now processed.
-			// 'root' and deleted objects have already been handled
-			foreach (batchOfJSONItems; jsonItemsToProcess.chunks(batchSize)) {
-				// Chunk the total items to process into 500 lot items
-				batchesProcessed++;
-				
-				if (log.verbose == 0) {
-					// Dynamic output for a non-verbose run so that the user knows something is happening
-					if (!appConfig.surpressLoggingOutput) {
-						write(".");
-					}
-				} else {
-					log.vlog("Processing OneDrive JSON item batch [", batchesProcessed,"/", batchCount, "] to ensure consistent local state");
-				}	
-					
-				// Process the batch
-				processJSONItemsInBatch(batchOfJSONItems, batchesProcessed, batchCount);
-				
-				// To finish off the JSON processing items, this is needed to reflect this in the log
-				log.vdebug("------------------------------------------------------------------");
+			string currentDeltaLink = null;
+			JSONValue deltaChanges;
+			
+			// Get the /delta changes from background worker
+			while (rawJsonItems.empty && !job.done()) {
+				Thread.sleep(dur!"seconds"(1));
 			}
+			// no more jsonItems and background worker has completed
+			if(rawJsonItems.empty && job.done())
+				break;
+
 			
-			if (log.verbose == 0) {
-				// close off '.' output
+			// Reset jsonItemsToProcess & processedCount
+			jsonItemsToProcess = [];
+
+			// get next jsonItem to be processed
+			deltaChanges = rawJsonItems.popFront();
+			if (deltaChanges.isNull())
+			// something went wrong ..
+				continue;
+
+			if ("@odata.nextLink" in deltaChanges)
+				currentDeltaLink = deltaChanges["@odata.nextLink"].str;
+			else if ("@odata.deltaLink" in deltaChanges)
+				currentDeltaLink = deltaChanges["@odata.deltaLink"].str;
+
+			ulong nrChanges = count(deltaChanges["value"].array);
+			int changeCount = 0;
+			
+			jsonItemsReceived = jsonItemsReceived + nrChanges;
+			
+			if (log.verbose <= 1) {
+				// Dynamic output for a non-verbose run so that the user knows something is happening
 				if (!appConfig.surpressLoggingOutput) {
-					writeln();
+					write(".");
 				}
+			} else {
+				log.vdebug("API Response Bundle: ", responseBundleCount, " - Quantity of 'changes|items' in this bundle to process: ", nrChanges);
 			}
 			
+
+			foreach (onedriveJSONItem; deltaChanges["value"].array) {
+				// increment change count for this item
+				changeCount++;
+				// Process the OneDrive object item JSON
+				processDeltaJSONItem(onedriveJSONItem, nrChanges, changeCount, responseBundleCount, singleDirectoryScope);
+			}
+			
+			// Are there items to process?
+			if (jsonItemsToProcess.length > 0) {	
+				// Process the batch
+				processJSONItemsInBatch(responseBundleCount);
+			}
 			// Free up memory and items processed as it is pointless now having this data around
 			jsonItemsToProcess = [];
+
+			// Upload the changes for local first mode
+			processChangedLocalItemsToUpload();
 			
-			// Debug output - what was processed
-			log.vdebug("Number of JSON items to process is: ", jsonItemsToProcess.length);
-			log.vdebug("Number of JSON items processed was: ", processedCount);	
-		} else {
-			if (!appConfig.surpressLoggingOutput) {
-				log.log("No additional changes or items that can be applied were discovered while processing the data received from Microsoft OneDrive");
+			// Process any download activities or cleanup actions
+			processDownloadActivities();
+
+			// Update the deltaLink in the database so that we can reuse this now that jsonItemsToProcess has been processed
+			if (!currentDeltaLink.empty) {
+				log.vdebug("Updating completed deltaLink in DB to: ", currentDeltaLink);
+				itemDB.setDeltaLink(driveIdToQuery, itemIdToQuery, currentDeltaLink);
 			}
 		}
-		
-		// Update the deltaLink in the database so that we can reuse this now that jsonItemsToProcess has been processed
-		if (!latestDeltaLink.empty) {
-			log.vdebug("Updating completed deltaLink in DB to: ", latestDeltaLink);
-			itemDB.setDeltaLink(driveIdToQuery, itemIdToQuery, latestDeltaLink);
+
+		// Log that we have finished querying the /delta API
+		if (log.verbose <= 1) {
+			if (!appConfig.surpressLoggingOutput) {
+				write("\n");
+			}
+		} else {
+			log.vdebug("Finished processing /delta JSON response from the OneDrive API");
 		}
+
+		log.vdebug("Number of JSON items processed was: ", processedCount);	
+
+		// clean up
+		rawJsonItems.clear();
+		// Cleanup array memory
+		skippedItems.clear();
 		
 		// Keep the driveIDsArray with unique entries only
 		if (!canFind(driveIDsArray, driveIdToQuery)) {
@@ -1097,17 +1105,16 @@ class SyncEngine {
 	}
 	
 	// Process each of the elements contained in jsonItemsToProcess[]
-	void processJSONItemsInBatch(JSONValue[] array, ulong batchGroup, ulong batchCount) {
-	
-		ulong batchElementCount = array.length;
+	void processJSONItemsInBatch(ulong batchGroup) {
+		ulong batchElementCount = jsonItemsToProcess.length;
 
-		foreach (i, onedriveJSONItem; array.enumerate) {
+		foreach (i, onedriveJSONItem; jsonItemsToProcess.enumerate) {
 			// Use the JSON elements rather can computing a DB struct via makeItem()
 			ulong elementCount = i +1;
 			
 			// To show this is the processing for this particular item, start off with this breaker line
 			log.vdebug("------------------------------------------------------------------");
-			log.vdebug("Processing OneDrive JSON item ", elementCount, " of ", batchElementCount, " as part of JSON Item Batch ", batchGroup, " of ", batchCount);
+			log.vdebug("Processing OneDrive JSON item ", elementCount, " of ", batchElementCount, " as part of JSON Item Batch ", batchGroup);
 			log.vdebug("Raw JSON OneDrive Item: ", onedriveJSONItem);
 			
 			string thisItemId = onedriveJSONItem["id"].str;
@@ -1584,12 +1591,6 @@ class SyncEngine {
 			downloadOneDriveItems();
 			// Cleanup array memory
 			fileJSONItemsToDownload = [];
-		}
-		
-		// Are there any skipped items still?
-		if (!skippedItems.empty) {
-			// Cleanup array memory
-			skippedItems.clear();
 		}
 	}
 	
@@ -2700,17 +2701,7 @@ class SyncEngine {
 			}
 		}
 		
-		// Are we doing a --download-only sync?
-		if (!appConfig.getValueBool("download_only")) {
-			// Do we have any known items, where the content has changed locally, that needs to be uploaded?
-			if (!databaseItemsWhereContentHasChanged.empty) {
-				// There are changed local files that were in the DB to upload
-				log.log("Changed local items to upload to OneDrive: ", databaseItemsWhereContentHasChanged.length);
-				processChangedLocalItemsToUpload();
-				// Cleanup array memory
-				databaseItemsWhereContentHasChanged = [];
-			}
-		}
+		processChangedLocalItemsToUpload();
 	}
 	
 	// Check this Database Item for its consistency on disk
@@ -3332,16 +3323,26 @@ class SyncEngine {
 	
 	// Process the list of local changes to upload to OneDrive
 	void processChangedLocalItemsToUpload() {
-		
-		// Each element in this array 'databaseItemsWhereContentHasChanged' is an Database Item ID that has been modified locally
-		ulong batchSize = appConfig.concurrentThreads;
-		ulong batchCount = (databaseItemsWhereContentHasChanged.length + batchSize - 1) / batchSize;
-		ulong batchesProcessed = 0;
-		
-		// For each batch of files to upload, upload the changed data to OneDrive
-		foreach (chunk; databaseItemsWhereContentHasChanged.chunks(batchSize)) {
-			uploadChangedLocalFileToOneDrive(chunk);
+		// Are we doing a --download-only sync?
+		if (!appConfig.getValueBool("download_only")) {
+			// Do we have any existing remote items, where the content is not in-sync with local ones, that needs to be uploaded?
+			if (!databaseItemsWhereContentHasChanged.empty) {
+				// There are changed local files that were not in DB to upload
+				log.log("Changed local items to upload to OneDrive: ", databaseItemsWhereContentHasChanged.length);
+					
+				// Each element in this array 'databaseItemsWhereContentHasChanged' is an Database Item ID that has been modified locally
+				ulong batchSize = appConfig.concurrentThreads;
+				ulong batchCount = (databaseItemsWhereContentHasChanged.length + batchSize - 1) / batchSize;
+				ulong batchesProcessed = 0;
+				
+				// For each batch of files to upload, upload the changed data to OneDrive
+				foreach (chunk; databaseItemsWhereContentHasChanged.chunks(batchSize)) {
+					uploadChangedLocalFileToOneDrive(chunk);
+				}
+			}
 		}
+		// Cleanup array memory
+		databaseItemsWhereContentHasChanged = [];	
 	}
 	
 	// Upload changed local files to OneDrive in parallel
